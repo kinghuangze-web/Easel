@@ -8,14 +8,17 @@ if os.name == "nt":
 else:
     import fcntl
 import hashlib
+import ipaddress
 import json
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from contextlib import asynccontextmanager
@@ -69,6 +72,11 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 REACT_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 OPENCLAW_PROFILE = "easel"
+# 对话传输层：http＝直连常驻网关（OpenAI 兼容端点，免每轮进程冷启动）；cli＝旧 spawn 路径（回退）
+# 对话传输层：cli=每轮 spawn `openclaw agent`（默认，久经考验）；http=直连常驻 gateway 的
+# OpenAI 兼容端点（省掉每轮 6-7s 冷启动）。默认保持 cli —— http 路径目前还不具备 CLI 路径的
+# 几项保证（见 _run_gateway_turn 上方说明），想提速的部署显式设 EASEL_CHAT_TRANSPORT=http 开启。
+CHAT_TRANSPORT = os.environ.get("EASEL_CHAT_TRANSPORT", "cli").strip().lower()
 OPENCLAW_WORKSPACE = Path.home() / ".openclaw" / f"workspace-{OPENCLAW_PROFILE}"
 # OpenClaw 会话历史（transcript）目录：<profile 配置目录>/agents/main/sessions/<session-id>.jsonl
 OPENCLAW_SESSIONS_DIR = Path.home() / f".openclaw-{OPENCLAW_PROFILE}" / "agents" / "main" / "sessions"
@@ -85,6 +93,58 @@ THINKING_LEVEL = (os.environ.get("EASEL_THINKING_LEVEL", "").strip() or "medium"
 # 的 OPENCLAW_RAW_STREAM/OPENCLAW_RAW_STREAM_PATH 写这个文件（见 scripts/gateway.sh）。
 # web 侧 tail 它做流式；默认值必须与 gateway.sh 里 EASEL_RAW_STREAM_PATH 的默认一致。
 SHARED_RAW_STREAM = Path(os.environ.get("EASEL_RAW_STREAM_PATH", "/tmp/easel-raw-stream.jsonl"))
+
+
+class _GatewayHttpProc:
+    """HTTP 直连模式下的「伪进程」：给主循环 / 停止逻辑提供 poll/wait/kill 兼容面。"""
+
+    def __init__(self) -> None:
+        self._done = False
+        self._task = None
+
+    def finish(self) -> None:
+        self._done = True
+
+    def poll(self):
+        return 0 if self._done else None
+
+    def terminate(self) -> None:
+        self._done = True
+        if self._task is not None:
+            try:
+                self._task.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def kill(self) -> None:
+        self.terminate()
+
+    def wait(self, timeout=None):  # 兼容 await asyncio.to_thread(proc.wait, ...)
+        # 必须真的等：主循环拿它来决定「能不能放掉会话双锁」。提前返回会让下一轮在
+        # 上一轮可能还在写同一份 transcript 时就启动 —— 正是双锁要防的并发写。
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self._done:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("gateway-http-turn", timeout)
+            time.sleep(0.05)
+        return 0
+
+
+def _gateway_http_ready() -> bool:
+    """探测 gateway 的 OpenAI 兼容端点是否可用（不可用则自动回退 CLI 路径）。
+
+    需要 openclaw 侧开启 gateway.http.endpoints.chatCompletions。
+    """
+    try:
+        import httpx  # noqa: F401  HTTP 路径全靠它做 SSE；没装就当端点不可用，回退 CLI
+    except ImportError:
+        return False
+    try:
+        rq = urllib.request.Request("http://127.0.0.1:18789/v1/models")
+        with urllib.request.urlopen(rq, timeout=2) as resp:
+            return resp.status == 200
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _heal_openclaw_session(sk: str) -> None:
@@ -548,9 +608,58 @@ def _skill_api_configured(skill: str, env: dict[str, str] | None = None) -> bool
     return False
 
 
+def _guard_env_values(updates: dict[str, str]) -> None:
+    """集中拦截 .env 值注入：值里带换行就能往 .env 追加任意行，而 setup.sh 会 `source .env`
+    —— 那等于任何能调到写 .env 接口的人都能执行命令。键名同理。两个写入口都必须先过这道。"""
+    for k, v in updates.items():
+        if any(c in (k or '') for c in '\r\n=') or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', k or ''):
+            raise HTTPException(400, f'非法的配置键名：{(k or "")[:40]!r}')
+        if any(c in (v or '') for c in '\r\n\x00'):
+            raise HTTPException(400, f'配置值不能包含换行符：{k}')
+
+
+# 设置面板里「改了 Base URL 就必须重填 Key」要比对的 .env 键位（槽位 → (base 键, key 键)）。
+_SLOT_ENV_KEYS = {
+    'openai': ('OPENAI_BASE_URL', 'OPENAI_API_KEY'),
+    'relay': ('EASEL_LLM_BASE_URL', 'EASEL_LLM_API_KEY'),
+    'anthropic': ('ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY'),
+    'siliconflow': ('SILICONFLOW_BASE_URL', 'SILICONFLOW_API_KEY'),
+}
+
+
+def _valid_base_url(u: str) -> bool:
+    '整串校验（不是只看开头）：必须是 http(s)://host，且不带控制字符与 URL 内嵌凭据。'
+    if any(c in u for c in '\r\n\t\x00') or '@' in u:
+        return False
+    try:
+        p = urllib.parse.urlparse(u)
+    except ValueError:
+        return False
+    return p.scheme in ('http', 'https') and bool(p.hostname)
+
+
+def _ssrf_safe(u: str) -> bool:
+    """自测会带着真 Key 去打这个地址，所以不许指向本机/内网/云元数据——
+    这些地址上的服务通常无鉴权，一旦被当成「模型端点」就成了打内网的跳板。"""
+    try:
+        host = urllib.parse.urlparse(u).hostname or ''
+        infos = socket.getaddrinfo(host, None)
+    except Exception:  # noqa: BLE001  解析不了就当不安全
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    return True
+
+
 def _write_env(updates: dict[str, str]) -> None:
     '就地更新命中的 KEY、其余行原样保留，未命中的追加末尾；空串则删除该行。原子写。'
     updates = {k: v for k, v in updates.items() if k in _ENV_ALLOWLIST}
+    _guard_env_values(updates)
     if not updates:
         return
     lines = ENV_FILE.read_text(encoding='utf-8').splitlines() if ENV_FILE.is_file() else []
@@ -910,6 +1019,568 @@ async def api_env_save(req: EnvUpdateRequest):
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 设置面板 · 环境安装（skills/shared/scripts/install_tool.py 引擎桥）
+# 体检走引擎 check --json；安装后台跑、前端轮询 /api/env/job/{id}。
+# ═══════════════════════════════════════════════════════════════════════
+
+INSTALL_TOOL = SHARED_SCRIPTS / "install_tool.py"
+_ENV_TOOLS_CACHE: dict = {"ts": 0.0, "data": None}
+_ENV_JOBS: dict[str, dict] = {}
+
+
+@app.get("/api/env/tools")
+async def api_env_tools(refresh: bool = False):
+    """环境体检：引擎 check --json（15 秒缓存；refresh=1 强制重测）。"""
+    if not refresh and _ENV_TOOLS_CACHE["data"] and time.time() - _ENV_TOOLS_CACHE["ts"] < 15:
+        return _ENV_TOOLS_CACHE["data"]
+    try:
+        proc = await asyncio.to_thread(lambda: subprocess.run(
+            [sys.executable, str(INSTALL_TOOL), "--json", "check"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=240, cwd=str(PROJECT_ROOT)))
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "环境体检超时，请稍后再试")
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        raise HTTPException(500, f"环境体检失败：{(proc.stderr or '').strip()[-300:] or '无输出'}")
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"体检输出解析失败：{e}")
+    data["cachedAt"] = int(time.time())
+    _ENV_TOOLS_CACHE.update({"ts": time.time(), "data": data})
+    return data
+
+
+class EnvInstallRequest(BaseModel):
+    id: str
+
+
+_INSTALL_IDS_CACHE: dict = {"ts": 0.0, "ids": frozenset()}
+
+
+def _install_tool_ids() -> frozenset[str]:
+    """引擎里真实存在的配方 id（缓存 5 分钟）。安装接口只认这张表里的 id——
+    只按正则放行的话，`--help` 这类带横线的串会被 argparse 当选项吃掉。"""
+    if _INSTALL_IDS_CACHE["ids"] and time.time() - _INSTALL_IDS_CACHE["ts"] < 300:
+        return _INSTALL_IDS_CACHE["ids"]
+    try:
+        p = subprocess.run([sys.executable, str(INSTALL_TOOL), "--json", "list"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=30, cwd=str(PROJECT_ROOT))
+        ids = frozenset(t["id"] for t in (json.loads(p.stdout).get("tools") or []) if t.get("id"))
+    except Exception:  # noqa: BLE001
+        return _INSTALL_IDS_CACHE["ids"]
+    if ids:
+        _INSTALL_IDS_CACHE.update({"ts": time.time(), "ids": ids})
+    return ids
+
+
+@app.post("/api/env/install")
+async def api_env_install(req: EnvInstallRequest):
+    """后台安装（引擎 install）：立即返回 jobId，前端轮询进度。"""
+    tid = (req.id or "").strip()
+    known = await asyncio.to_thread(_install_tool_ids)
+    if tid not in known:
+        raise HTTPException(400, f"无效的工具 id：{tid[:40]!r}")
+    job_id = uuid.uuid4().hex[:16]
+    if len(_ENV_JOBS) >= 200:                   # 任务表不能无限长：清掉最老的已结束任务
+        for k, _ in sorted((kv for kv in _ENV_JOBS.items() if kv[1].get("ended")),
+                           key=lambda kv: kv[1]["ended"])[:100]:
+            _ENV_JOBS.pop(k, None)
+    job = {"jobId": job_id, "id": tid, "state": "running", "lines": [],
+           "result": None, "started": int(time.time()), "ended": None}
+    _ENV_JOBS[job_id] = job
+
+    def _run() -> None:
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(INSTALL_TOOL), "--json", "install", tid],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", cwd=str(PROJECT_ROOT))
+            # stdout 必须**并发**抽干：串行地先读完 stderr 再读 stdout，子进程一旦往 stdout
+            # 写满管道缓冲（64K）就会阻塞，而我们还堵在 stderr 上——双向死锁。
+            _out: list[str] = []
+            t_out = threading.Thread(target=lambda: _out.append(proc.stdout.read() or ""), daemon=True)
+            t_out.start()
+            for line in proc.stderr:            # 引擎进度日志走 stderr
+                line = line.rstrip()
+                if line:
+                    job["lines"] = (job["lines"] + [line])[-40:]   # 只留最近 40 行（换列表，避免读端正在序列化时被就地改）
+            try:
+                proc.wait(timeout=3600)
+            except subprocess.TimeoutExpired:   # 卡死的安装进程必须真的杀掉，否则线程与子进程永久泄漏
+                proc.kill()
+                proc.wait(timeout=30)
+                raise
+            t_out.join(timeout=30)
+            out = ("".join(_out)).strip()
+            if out:
+                job["result"] = (json.loads(out).get("results") or [None])[0]
+            job["state"] = "ok" if (job["result"] or {}).get("state") == "ok" else "fail"
+        except Exception as e:  # noqa: BLE001
+            job["state"] = "fail"
+            job["result"] = {"id": tid, "state": "fail", "detail": f"{type(e).__name__}: {e}"}
+        finally:
+            job["ended"] = int(time.time())
+            _ENV_TOOLS_CACHE["ts"] = 0.0        # 装完让下一次体检不吃旧缓存
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"jobId": job_id, "id": tid, "state": "running"}
+
+
+@app.get("/api/env/job/{job_id}")
+async def api_env_job(job_id: str):
+    """查安装进度：running / ok / fail + 最近日志行 + 最终结果。"""
+    job = _ENV_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在（服务可能重启过）")
+    return job
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 设置面板 · 模型配置（v1：按真实 .env / openclaw.json 只读展示 + 真自测）
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _mask_key(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        return ""
+    return f"«{v[:5]}…{v[-4:]}»" if len(v) > 14 else "«已配置»"
+
+
+def _model_channels() -> dict:
+    env = _read_env()
+    primary = ""
+    try:
+        oc = Path.home() / ".openclaw-easel" / "openclaw.json"
+        if oc.is_file():
+            primary = str(json.loads(oc.read_text(encoding="utf-8"))
+                          .get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""))
+    except Exception:  # noqa: BLE001
+        pass
+
+    chat_rows = []
+    ob = (env.get("OPENAI_BASE_URL") or "").strip()
+    om = (env.get("OPENAI_MODEL") or "").strip()
+    ok_key = bool((env.get("OPENAI_API_KEY") or "").strip())
+    if ob or ok_key:
+        chat_rows.append({
+            "slot": "openai", "order": 1, "name": "deepseek",
+            "sub": "官方直连",
+            "type": "openai", "model": om or "deepseek-chat",
+            "baseUrl": ob, "keyMasked": _mask_key(env.get("OPENAI_API_KEY", "")),
+            "role": "主" if primary.startswith("openai/") else "备",
+            "result": "已配置" if ok_key else "缺 key",
+        })
+    ab = (env.get("ANTHROPIC_BASE_URL") or "").strip()
+    ak = (env.get("ANTHROPIC_API_KEY") or "").strip()
+    if ab or ak:
+        chat_rows.append({
+            "slot": "anthropic", "order": len(chat_rows) + 1, "name": "anthropic", "sub": "官方直连",
+            "type": "anthropic", "model": (env.get("CLAUDE_MODEL") or "claude-sonnet-4-6").strip(),
+            "baseUrl": ab or "官方", "keyMasked": _mask_key(ak),
+            "role": "备", "result": "已配置" if ak else "缺 key",
+        })
+    lb = (env.get("EASEL_LLM_BASE_URL") or "").strip()
+    lk = (env.get("EASEL_LLM_API_KEY") or "").strip()
+    if lb or lk:
+        chat_rows.append({
+            "slot": "relay", "order": len(chat_rows) + 1, "name": "relay", "sub": "中转站",
+            "type": "openai", "model": (env.get("CLAUDE_MODEL") or "deepseek-chat").strip(),
+            "baseUrl": lb or "（未配置）", "keyMasked": _mask_key(lk),
+            "role": "备", "result": "已配置" if lk else "缺 key",
+        })
+
+    custom_rows = []
+    try:
+        oc = Path.home() / ".openclaw-easel" / "openclaw.json"
+        if oc.is_file():
+            provs = (json.loads(oc.read_text(encoding="utf-8"))
+                     .get("models", {}).get("providers", {})) or {}
+            for pkey, pv in provs.items():
+                if pkey in ("openai", "anthropic", "relay") or not isinstance(pv, dict):
+                    continue
+                models = pv.get("models") if isinstance(pv.get("models"), list) else []
+                mid = models[0].get("id", "") if models and isinstance(models[0], dict) else ""
+                custom_rows.append({
+                    "slot": "custom", "order": 0, "name": pkey, "sub": "自定义",
+                    "type": "openai", "model": mid or "", "baseUrl": pv.get("baseUrl") or "",
+                    "keyMasked": _mask_key(str(pv.get("apiKey") or "")),
+                    "role": "主" if primary == f"{pkey}/{mid}" else "备",
+                    "result": "已配置" if str(pv.get("apiKey") or "").strip() else "缺 key",
+                    "deletable": True,
+                })
+    except Exception:  # noqa: BLE001
+        pass
+    chat_rows.extend(custom_rows)
+
+    sf = bool((env.get("SILICONFLOW_API_KEY") or "").strip())
+    trans_rows = [
+        {"order": 0, "name": "自带字幕", "sub": "视频自带 SRT/VTT 时直接读", "type": "脚本层",
+         "model": "—", "baseUrl": "—", "keyMasked": "—", "role": "免配", "result": "优先"},
+        {"slot": "siliconflow", "order": 1, "name": "siliconflow", "sub": "硅基流动", "type": "openai",
+         "model": "SenseVoiceSmall", "baseUrl": "https://api.siliconflow.cn/v1",
+         "keyMasked": _mask_key(env.get("SILICONFLOW_API_KEY", "")), "role": "主",
+         "result": "已配置" if sf else "缺 key"},
+    ]
+    channels: dict = {"chat": {"rows": chat_rows}, "transcribe": {"rows": trans_rows}}
+    try:
+        import model_registry as _mr  # skills/shared/scripts 已在 sys.path 上
+        _setting_env = {"video": "VIDEO_PROVIDER", "music": "MUSIC_PROVIDER", "voice": "VOICE_PROVIDER"}
+        for _gid, _ch in (("image", "image"), ("video", "video"), ("music", "music"), ("voice", "speech")):
+            _spec = _mr.MODEL_GROUPS[_gid]
+            _chosen = (env.get(_setting_env.get(_gid, ""), "") or "").strip()
+            _rows = []
+            for _p in _spec["providers"]:
+                _req = [k for k in _p["keys"] if k["required"]]
+                _bk = next((k for k in _p["keys"] if not k["secret"]
+                            and ("BASE" in k["env"] or "URL" in k["env"])), None)
+                _mk = next((k for k in _p["keys"] if not k["secret"] and "MODEL" in k["env"]), None)
+                _edit_keys = [k for k in _req if k is not _bk and k is not _mk]
+                _k1 = _edit_keys[0] if _edit_keys else None
+                _k2 = _edit_keys[1] if len(_edit_keys) > 1 else None
+                _ok = all(_is_set(env.get(k["env"])) or any(_is_set(env.get(a)) for a in k.get("aliases", []))
+                          for k in _req)
+                _masked = ""
+                if _k1:
+                    _raw = env.get(_k1["env"], "")
+                    if not _raw:
+                        for _a in _k1.get("aliases", []):
+                            if env.get(_a):
+                                _raw = env[_a]
+                                break
+                    _masked = _mask_key(_raw)
+                _rows.append({
+                    "slot": _p["id"], "order": 0, "name": _p["name"], "sub": _gid,
+                    "type": _p["id"], "model": (env.get(_mk["env"]) or "").strip() if _mk else "",
+                    "baseUrl": (env.get(_bk["env"]) or "").strip() if _bk else "",
+                    "keyMasked": _masked, "role": "主" if (_gid == "image" or _chosen == _p["id"]) else "备",
+                    "result": "已配置" if _ok else "未配置",
+                    "key2Label": _k2["label"] if _k2 else "",
+                    "key2Masked": _mask_key(env.get(_k2["env"], "")) if _k2 and _k2["secret"] else "",
+                    "modelEditable": _mk is not None,
+                    "baseEditable": _bk is not None,
+                    "baseOptional": (_bk is None) or (not _bk["required"]),
+                })
+            channels[_ch] = {"rows": _rows}
+    except Exception:  # noqa: BLE001
+        pass
+    return {"channels": channels, "primary": primary}
+
+
+@app.get("/api/settings/models")
+async def api_settings_models():
+    """模型通道：chat / transcribe（含可编辑的原值；key 只回脱敏）。"""
+    return _model_channels()
+
+
+def _write_env_direct(updates: dict[str, str]) -> None:
+    """后端受控键位专用：就地更新/追加 .env（不做 allowlist 过滤，仅服务端固定映射调用）。原子写。"""
+    updates = {k: v for k, v in updates.items() if k and v.strip() != ''}
+    if not updates:
+        return
+    _guard_env_values(updates)
+    lines = ENV_FILE.read_text(encoding='utf-8').splitlines() if ENV_FILE.is_file() else []
+    seen = set()
+    out = []
+    for line in lines:
+        s = line.strip()
+        matched = None
+        if s and not s.startswith('#') and '=' in s:
+            k = s.split('=', 1)[0].strip()
+            if k in updates:
+                matched = k
+        if matched is not None:
+            seen.add(matched)
+            out.append(f'{matched}={updates[matched]}')
+            continue
+        out.append(line)
+    appended = [f'{k}={v}' for k, v in updates.items() if k not in seen]
+    if appended:
+        if out and out[-1].strip() != '':
+            out.append('')
+        out.append('# ---- Easel 模型配置（Web 设置面板写入）----')
+        out.extend(appended)
+    tmp = ENV_FILE.with_suffix('.env.tmp')
+    tmp.write_text('\n'.join(out) + '\n', encoding='utf-8')
+    tmp.replace(ENV_FILE)
+
+
+RESERVED_PROVIDER_KEYS = {"openai", "anthropic", "relay"}
+
+
+def _openclaw_provider_creds() -> dict[str, tuple[str, str]]:
+    """读 openclaw.json 里每个 chat 供应商现存的 (baseUrl, apiKey)。读不到就当空表（不阻断保存）。"""
+    try:
+        oc = Path.home() / '.openclaw-easel' / 'openclaw.json'
+        provs = json.loads(oc.read_text(encoding='utf-8')).get('models', {}).get('providers', {})
+        return {k: (str(v.get('baseUrl') or ''), str(v.get('apiKey') or ''))
+                for k, v in provs.items() if isinstance(v, dict)}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _sync_openclaw_chat(provider_updates: dict[str, dict], keep_custom: set[str], primary_ref: str) -> str:
+    """同步 chat 供应商到 ~/.openclaw-easel/openclaw.json：更新/新增 + 删除多余自定义 + 主模型。
+
+    provider_updates: {pkey: {"model","base","key"}}；keep_custom: 保留的自定义键；primary_ref: 目标主模型（空=不改）。
+    只有确有差异才落盘（改前备份 .bak-web）。
+    """
+    try:
+        oc = Path.home() / '.openclaw-easel' / 'openclaw.json'
+        if not oc.is_file():
+            return ''
+        data = json.loads(oc.read_text(encoding='utf-8'))
+        providers = data.setdefault('models', {}).setdefault('providers', {})
+        changed = False
+        for pkey in [k for k in list(providers.keys())
+                     if k not in RESERVED_PROVIDER_KEYS and k not in keep_custom]:
+            providers.pop(pkey, None)
+            changed = True
+        for pkey, vals in provider_updates.items():
+            prov = providers.setdefault(pkey, {})
+            base, key, model = vals.get('base', ''), vals.get('key', ''), vals.get('model', '')
+            if base and prov.get('baseUrl') != base:
+                _cur = str(prov.get('baseUrl') or '')
+                if _cur.startswith('http://127.0.0.1:8890'):
+                    pass  # 本地模型网关模式：保留网关地址（真实上游在 easel-models.yaml），勿改回直连
+                else:
+                    prov['baseUrl'] = base
+                    changed = True
+            if key and prov.get('apiKey') != key:
+                prov['apiKey'] = key
+                changed = True
+            if model:
+                models = prov.get('models') if isinstance(prov.get('models'), list) and prov.get('models') else [{}]
+                if not isinstance(models[0], dict):
+                    models = [{}]
+                if models[0].get('id') != model:
+                    models[0]['id'] = model
+                    changed = True
+                prov['models'] = models
+        if primary_ref:
+            ref = data.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})
+            if ref.get('primary') != primary_ref:
+                ref['primary'] = primary_ref
+                changed = True
+        if not changed:
+            return ''
+        shutil.copy2(oc, oc.parent / (oc.name + '.bak-web'))
+        tmp = oc.parent / (oc.name + '.tmp')
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        tmp.replace(oc)
+        return 'openclaw 已同步（下一条消息生效）'
+    except Exception as e:  # noqa: BLE001
+        return f'openclaw 同步失败：{e}'
+
+
+class ModelSaveRow(BaseModel):
+    slot: str = ""
+    name: str = ""
+    model: str = ""
+    baseUrl: str = ""
+    key: str = ""
+    key2: str = ""
+    primary: bool = False
+
+
+class ModelSaveRequest(BaseModel):
+    channel: str = "chat"
+    rows: list[ModelSaveRow] = Field(default_factory=list)
+
+
+@app.post("/api/settings/models/save")
+async def api_settings_models_save(req: ModelSaveRequest):
+    """保存模型通道：.env 就地更新（key 留空=不改）；chat 同步 openclaw；媒体通道写 provider 配置。"""
+    ch0 = (req.channel or "").strip()
+    if ch0 in ("speech", "image", "video", "music"):
+        import model_registry as _mr2
+        _gid0 = {"speech": "voice", "image": "image", "video": "video", "music": "music"}[ch0]
+        _spec0 = _mr2.MODEL_GROUPS[_gid0]
+        _by_id = {p["id"]: p for p in _spec0["providers"]}
+        _setting0 = {"video": "VIDEO_PROVIDER", "music": "MUSIC_PROVIDER", "voice": "VOICE_PROVIDER"}.get(_gid0)
+        _mupd: dict[str, str] = {}
+        _primary0 = ""
+        _env0 = _read_env()
+        for _row in req.rows:
+            _pid = (_row.slot or "").strip()
+            _p0 = _by_id.get(_pid)
+            if not _p0:
+                raise HTTPException(400, f"不认识的服务商：{_pid or '（空）'}")
+            _base0 = (_row.baseUrl or "").strip().rstrip("/")
+            _key0 = (_row.key or "").strip()
+            _key20 = (_row.key2 or "").strip()
+            _model0 = (_row.model or "").strip()
+            if _base0 and not _valid_base_url(_base0):
+                raise HTTPException(400, f'{_p0["name"]} 的根地址需是合法的 http(s):// 地址')
+            if (_key0 and any(x.isspace() for x in _key0)) or (_key20 and any(x.isspace() for x in _key20)):
+                raise HTTPException(400, f'{_p0["name"]} 的 Key 不能包含空白字符')
+            _bk0 = next((k for k in _p0["keys"] if not k["secret"]
+                         and ("BASE" in k["env"] or "URL" in k["env"])), None)
+            _mk0 = next((k for k in _p0["keys"] if not k["secret"] and "MODEL" in k["env"]), None)
+            _req0 = [k for k in _p0["keys"] if k["required"] and k is not _bk0 and k is not _mk0]
+            # 与对话通道同一条规矩：只改根地址、Key 留空（留空=沿用旧 Key），等于把已存的真 Key
+            # 指到新地址去——SILICONFLOW 这类通道还有「连通性自测」会把它当 Bearer 发过去。
+            if _base0 and _bk0 and not _key0 and _base0 != (_env0.get(_bk0["env"], "") or "").strip().rstrip("/") \
+                    and _req0 and (_env0.get(_req0[0]["env"], "") or "").strip():
+                raise HTTPException(400, f'更换{_p0["name"]}的根地址时必须重新填写 Key')
+            if _key0 and _req0:
+                _mupd[_req0[0]["env"]] = _key0
+            if _key20 and len(_req0) > 1:
+                _mupd[_req0[1]["env"]] = _key20
+            if _model0 and _mk0:
+                _mupd[_mk0["env"]] = _model0
+            if _base0 and _bk0:
+                _mupd[_bk0["env"]] = _base0
+            if getattr(_row, "primary", False):
+                _primary0 = _pid
+        if _primary0 and _setting0:
+            _mupd[_setting0] = _primary0
+        if not _mupd:
+            raise HTTPException(400, "没有可保存的改动（key 留空表示不改）")
+        _write_env_direct(_mupd)
+        _resp0 = {"ok": True, "note": ""}
+        _resp0.update(_model_channels())
+        return _resp0
+
+    updates: dict[str, str] = {}
+    provider_updates: dict[str, dict] = {}
+    keep_custom: set[str] = set()
+    primary_ref = ''
+    is_chat = (req.channel or '').strip() == 'chat'
+    _cur_env = _read_env()
+    _cur_prov = _openclaw_provider_creds() if is_chat else {}
+    for row in req.rows:
+        slot = (row.slot or '').strip()
+        name = (row.name or '').strip().lower()
+        model = (row.model or '').strip()
+        base = (row.baseUrl or '').strip().rstrip('/')
+        key = (row.key or '').strip()
+        if base and not _valid_base_url(base):
+            raise HTTPException(400, f'Base URL 需是合法的 http(s):// 地址：{base[:60]}')
+        if key and any(ch.isspace() for ch in key):
+            raise HTTPException(400, 'API Key 不能包含空白字符')
+        if len(model) > 120 or len(base) > 300 or len(key) > 400:
+            raise HTTPException(400, '字段过长，请检查')
+        # 改 Base URL 但把 Key 留空（留空=沿用旧 Key）＝ 把已存的真 Key 指向新地址，
+        # 之后一次「连通性自测」就会把它当 Bearer 送到新地址去。换地址必须重填 Key。
+        _be, _ke = _SLOT_ENV_KEYS.get(slot, ('', ''))
+        if base and _be and not key and base != (_cur_env.get(_be, '') or '').strip().rstrip('/') \
+                and (_cur_env.get(_ke, '') or '').strip():
+            raise HTTPException(400, f'更换 Base URL 时必须重新填写 API Key（{slot}）')
+        pkey = ''
+        if slot == 'openai':
+            if model:
+                updates['OPENAI_MODEL'] = model
+            if base:
+                updates['OPENAI_BASE_URL'] = base
+            if key:
+                updates['OPENAI_API_KEY'] = key
+            if is_chat:
+                provider_updates['openai'] = {'model': model, 'base': base, 'key': key}
+                pkey = 'openai'
+        elif slot == 'relay':
+            if base:
+                updates['EASEL_LLM_BASE_URL'] = base
+            if model:
+                updates['CLAUDE_MODEL'] = model
+            if key:
+                updates['EASEL_LLM_API_KEY'] = key
+            if is_chat:
+                pkey = 'relay'
+        elif slot == 'anthropic':
+            if model:
+                updates['CLAUDE_MODEL'] = model
+            if key:
+                updates['ANTHROPIC_API_KEY'] = key
+            if is_chat:
+                pkey = 'anthropic'
+        elif slot == 'siliconflow':
+            if base:
+                updates['SILICONFLOW_BASE_URL'] = base
+            if key:
+                updates['SILICONFLOW_API_KEY'] = key
+        elif slot == 'custom' and is_chat:
+            if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,23}', name):
+                raise HTTPException(400, f'供应商名只能用小写字母/数字/横线（最长24位）：{name[:30] or "（空）"}')
+            if name in RESERVED_PROVIDER_KEYS:
+                raise HTTPException(400, f'「{name}」是内置槽位名，请换一个')
+            if not model or not base:
+                raise HTTPException(400, f'自定义供应商「{name}」需要同时填模型和 Base URL')
+            provider_updates[name] = {'model': model, 'base': base, 'key': key}
+            keep_custom.add(name)
+            pkey = name
+        # 同一条规矩也得覆盖 openclaw.json 这一侧：_sync_openclaw_chat 只在 key 非空时改
+        # apiKey，却无条件改 baseUrl —— 只换地址、Key 留空，下一轮对话就会拿着原 Key 去打新地址。
+        # 自定义供应商压根不写 .env，前面那道 _SLOT_ENV_KEYS 闸拦不到它。
+        if is_chat and pkey and base and not key:
+            _pb, _pk = _cur_prov.get(pkey, ('', ''))
+            if _pk and base != _pb.strip().rstrip('/'):
+                raise HTTPException(400, f'更换 Base URL 时必须重新填写 API Key（{pkey}）')
+        if is_chat and pkey and getattr(row, 'primary', False) and model:
+            primary_ref = f'{pkey}/{model}'
+    if not updates and not provider_updates and not primary_ref:
+        raise HTTPException(400, '没有可保存的改动（key 留空表示不改）')
+    if updates:
+        _write_env_direct(updates)
+    note = ''
+    if is_chat:
+        note = _sync_openclaw_chat(provider_updates, keep_custom, primary_ref)
+    resp = {"ok": True, "note": note}
+    resp.update(_model_channels())
+    return resp
+
+
+class SelftestRequest(BaseModel):
+    channel: str = "chat"
+
+
+@app.post("/api/settings/models/selftest")
+async def api_models_selftest(req: SelftestRequest):
+    """真自测：对已配置的 OpenAI 兼容通道发 GET {base}/models 并计耗时。"""
+    channel = (req.channel or "all").strip()
+    env = _read_env()
+    targets: list[tuple[str, str]] = []
+    if channel in ("chat", "all"):
+        for base, key in ((env.get("ANTHROPIC_BASE_URL", ""), env.get("ANTHROPIC_API_KEY", "")),
+                          (env.get("OPENAI_BASE_URL", ""), env.get("OPENAI_API_KEY", "")),
+                          (env.get("EASEL_LLM_BASE_URL", ""), env.get("EASEL_LLM_API_KEY", ""))):
+            if base.strip() and key.strip():
+                targets.append((base.strip().rstrip("/"), key.strip()))
+    if channel in ("transcribe", "all") and (env.get("SILICONFLOW_API_KEY") or "").strip():
+        targets.append(((env.get("SILICONFLOW_BASE_URL") or "https://api.siliconflow.cn/v1").strip().rstrip("/"),
+                        env["SILICONFLOW_API_KEY"].strip()))
+
+    # 这里会把真实 API Key 当 Bearer 发出去，所以目标地址必须先过闸：
+    # 合法 http(s)、且不指向本机/内网/云元数据；跳转也不跟（跟了等于绕过前面的判断）。
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_a, **_kw):
+            return None
+
+    _opener = urllib.request.build_opener(_NoRedirect)
+
+    def _probe(base: str, key: str) -> dict:
+        t0 = time.time()
+        if not _valid_base_url(base):
+            return {"baseUrl": base, "ok": False, "ms": 0, "detail": "Base URL 不合法，未发起请求"}
+        if not _ssrf_safe(base):
+            return {"baseUrl": base, "ok": False, "ms": 0,
+                    "detail": "目标指向本机/内网地址，已拒绝（避免把 API Key 发给内网服务）"}
+        try:
+            rq = urllib.request.Request(base + "/models", headers={"Authorization": f"Bearer {key}"})
+            with _opener.open(rq, timeout=15) as resp:
+                return {"baseUrl": base, "ok": resp.status == 200, "ms": int((time.time() - t0) * 1000)}
+        except Exception as e:  # noqa: BLE001
+            return {"baseUrl": base, "ok": False, "ms": int((time.time() - t0) * 1000),
+                    "detail": f"{type(e).__name__}: {e}"[:140]}
+
+    results = await asyncio.to_thread(lambda: [_probe(b, k) for b, k in targets])
+    return {"channel": channel, "results": results, "testedAt": int(time.time())}
+
+
 class AttachmentRef(BaseModel):
     id: str
     name: str
@@ -1257,6 +1928,84 @@ async def api_chat_stream(req: ChatRequest):
                 pass
             client_q.put_nowait({"t": kind, "text": text, "id": event_seq, **extra})
 
+        # 秒级反馈：发出即亮「已收到」，不等 agent 冷启动（首个 SSE 事件，随流回放必达）
+        to_client("activity", "⏳ 已收到，正在唤醒 agent…")
+
+        async def _run_gateway_turn(hproc):
+            """HTTP 直连常驻网关跑一轮（OpenAI 兼容端点 /v1/chat/completions，原生 SSE）。
+
+            与 CLI 路径的差异：agent 在常驻 gateway 进程里直接跑，无每轮进程冷启动；
+            正文 token 经 SSE 直接进 q（与 CLI 路径共享同一消费出口）；
+            收尾由主循环统一负责（proc.poll() 兼容面）。
+            """
+            body = {
+                "model": "openclaw/default",
+                "stream": True,
+                "messages": [{"role": "user", "content": message}],
+            }
+            # session-id 必须跟 CLI 路径钉死同一个（见 _openclaw_session_id）：只带 session-key
+            # 的话网关会自己另起一个 transcript —— 跨天空闲后丢历史，且万一本轮回退 CLI，
+            # 两条路径会写进不同的会话文件，对话历史直接劈叉。
+            headers = {"x-openclaw-session-key": f"agent:main:{sk}",
+                       "x-openclaw-session-id": _openclaw_session_id(sk)}
+            tool_noted = False
+            saw_done = False
+            got_text = False
+            try:
+                import httpx as _httpx
+                timeout = _httpx.Timeout(TIMEOUT_CHAT + 60, connect=10)
+                async with _httpx.AsyncClient(timeout=timeout) as client:
+                    async with client.stream(
+                            "POST", "http://127.0.0.1:18789/v1/chat/completions",
+                            json=body, headers=headers) as resp:
+                        if resp.status_code != 200:
+                            raw = (await resp.aread())[:200].decode("utf-8", "replace")
+                            to_client("error", f"❌ 对话失败（HTTP {resp.status_code}）：{raw[:160]}")
+                            return
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].lstrip()   # SSE 允许 `data:{…}`（冒号后无空格）
+                            if payload == "[DONE]":
+                                saw_done = True
+                                break
+                            try:
+                                d = json.loads(payload)
+                            except ValueError:
+                                continue
+                            if isinstance(d.get("error"), dict):   # 200 里夹错误对象：不能当正常流吞掉
+                                to_client("error", f"❌ 网关返回错误：{str(d['error'])[:160]}")
+                                return
+                            delta = (d.get("choices") or [{}])[0].get("delta") or {}
+                            # 思考流：HTTP 模式不 tail 共享 raw 文件，thinking 事件的唯一来源就是
+                            # 这里的 reasoning 增量。不接的话「💭 思考过程」面板在本路径下永远是空的。
+                            rc = delta.get("reasoning_content") or delta.get("reasoning")
+                            if rc:
+                                run_info["thinking_chars"] += len(rc)
+                                _emit("thinking", rc)
+                            c = delta.get("content")
+                            if c:
+                                got_text = True
+                                _emit("token", c)
+                            if delta.get("tool_calls") and not tool_noted:
+                                tool_noted = True
+                                to_client("activity", "🔧 正在执行操作…")
+                # 流正常结束却既没正文也没 [DONE]：多半是端点没真开或中途断了。
+                # 不报错的话这一轮会静默落一条空回答，还会被 /api/chat/last 原样取回。
+                if not got_text and not saw_done:
+                    to_client("error", "❌ 网关流异常结束：没有收到任何内容（检查 "
+                                       "gateway.http.endpoints.chatCompletions 是否开启，"
+                                       "或设 EASEL_CHAT_TRANSPORT=cli 回退）")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                to_client("error", f"❌ 网关连接失败：{str(e)[:140]}")
+            finally:
+                # 先把 SENTINEL 排进 q（FIFO 保证它排在本轮所有 token 之后），再标记完成：
+                # 主循环读到它时，前面的 token 必然已全部消费过。
+                q.put_nowait(SENTINEL)
+                hproc.finish()
+
         _heal_openclaw_session(sk)       # 清洗历史里无签名 thinking 块，防回放失效
         # 原始事件流由常驻 gateway 写到共享文件（见 SHARED_RAW_STREAM / scripts/gateway.sh），
         # 不是 agent 客户端写的。本轮开始时记下文件当前尾偏移：只读此偏移之后追加的行，
@@ -1301,22 +2050,29 @@ async def api_chat_stream(req: ChatRequest):
             client_q.put_nowait(CLIENT_DONE)
             return
 
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                cwd=str(PROJECT_ROOT), text=True, bufsize=1, env=env,
-            )
-        except BaseException:
-            lock.release()
-            xlock.release()
-            _save_turn(pk, "done", "❌ 启动失败，请重试", {
-                "turn_id": turn_id, "clean_end": False, "stop_reason": "spawn_failed",
-            })
-            to_client("error", "❌ 启动失败，请重试")
-            to_client("done", sessionKey=sk)
-            client_q.put_nowait(CLIENT_DONE)
-            return
-        _RUNNING_CHAT[sk] = proc         # 注册运行中进程，供 /api/chat/stop 显式终止
+        # 探测是阻塞 urllib（最多 2s），必须丢线程：直接在协程里调会把整个事件循环
+        # ——连同其它会话正在推的 SSE ——卡住 2 秒。
+        is_http = CHAT_TRANSPORT == "http" and await asyncio.to_thread(_gateway_http_ready)
+        if is_http:
+            # HTTP 直连常驻网关：无进程冷启动（agent 在 gateway 进程里跑）
+            proc = _GatewayHttpProc()
+        else:
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    cwd=str(PROJECT_ROOT), text=True, bufsize=1, env=env,
+                )
+            except BaseException:
+                lock.release()
+                xlock.release()
+                _save_turn(pk, "done", "❌ 启动失败，请重试", {
+                    "turn_id": turn_id, "clean_end": False, "stop_reason": "spawn_failed",
+                })
+                to_client("error", "❌ 启动失败，请重试")
+                to_client("done", sessionKey=sk)
+                client_q.put_nowait(CLIENT_DONE)
+                return
+        _RUNNING_CHAT[sk] = proc         # 注册运行中进程（HTTP 模式为伪进程），供 /api/chat/stop
         # 经 gateway 后客户端 stdout 没有 model-fetch 标记（那是独立跑 agent 才有），先立刻
         # 给一个「正在思考」活动指示，随后 token 从共享 raw stream 流进来接管显示。
         to_client("activity", "🧠 正在思考…")
@@ -1349,6 +2105,11 @@ async def api_chat_stream(req: ChatRequest):
 
         def _emit(kind: str, text: str):
             loop.call_soon_threadsafe(q.put_nowait, {"t": kind, "text": text})
+
+        # 必须等 q / run_info / _emit 都就位后再起这一轮：_run_gateway_turn 闭包引用它们，
+        # 早一步 create_task 就只能靠「中间没有 await」来侥幸，改一行同步代码就会崩。
+        if is_http:
+            proc._task = loop.create_task(_run_gateway_turn(proc))
 
         # ---- ask_user 问答题桥接：轮询 gateway 的 pending question，推给前端渲染 ----
         # 背景：OpenClaw 的 ask_user 注册到 gateway 进程内，Easel 前端不消费 question RPC → 选项不可见。
@@ -1486,11 +2247,15 @@ async def api_chat_stream(req: ChatRequest):
             finally:
                 loop.call_soon_threadsafe(q.put_nowait, SENTINEL)
 
-        stdout_fut = loop.run_in_executor(None, _drain_stdout)
-        loop.run_in_executor(None, _tail)
+        stdout_fut = None
+        if not is_http:
+            stdout_fut = loop.run_in_executor(None, _drain_stdout)
+            loop.run_in_executor(None, _tail)
 
         deadline = time.monotonic() + TIMEOUT_CHAT + 30
         emitted = False
+        # 两条路径都靠「队列里读到 SENTINEL」收尾。HTTP 模式若改用带外标志（一开始就置 True），
+        # 最后一批还排在 q 里没被消费的 token 会随 poll() 转为已完成而被直接丢掉——答案尾巴被截。
         tail_finished = False
         try:
             while True:
@@ -1524,10 +2289,11 @@ async def api_chat_stream(req: ChatRequest):
                     to_client("question", item["text"])
             rc = proc.poll()
             # 等 stdout 读完（stopReason 行在进程收尾时才打印，避免 _tail 先发 SENTINEL 时漏读）
-            try:
-                await asyncio.wait_for(stdout_fut, timeout=2)
-            except Exception:
-                pass
+            if stdout_fut is not None:
+                try:
+                    await asyncio.wait_for(stdout_fut, timeout=2)
+                except Exception:
+                    pass
             sr = run_info.get("stop_reason")
             if not emitted:
                 clean = clean_agent_output("".join(stdout_lines))
@@ -1793,7 +2559,10 @@ async def api_skill(req: SkillRequest):
 
 
 @app.get("/api/outputs")
-async def api_outputs():
+def api_outputs():
+    # 产物树是全量递归扫描（文件量大时单次可达数十秒）。必须是同步 handler：
+    # FastAPI 会自动放入线程池执行；若写成 async def 直调，扫描期间会阻塞事件循环，
+    # 全站所有请求（含 /api/status）一起挂起等它。
     return get_output_tree()
 
 

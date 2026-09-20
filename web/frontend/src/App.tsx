@@ -14,6 +14,7 @@ import PublishPage from './components/PublishPage';
 import BreakdownPage from './components/BreakdownPage';
 import SubNav from './components/SubNav';
 import OnboardingWizard from './components/OnboardingWizard';
+import SettingsPanel from './components/SettingsPanel';
 import { fetchStatus, fetchPersonas, streamChat, fetchLastTurn, stopChat } from './lib/api';
 import type { PersonaItem, UploadedFile, ChatQuestion } from './lib/api';
 import { questionStatus } from './lib/api';
@@ -52,6 +53,7 @@ export default function App() {
   const [gatewayStatus, setGatewayStatus] = useState('connecting');
   const [showRecommend, setShowRecommend] = useState(false);
   const [showWizard, setShowWizard] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   // 挂载时决定进哪个会话。规则：
   //  - 同一标签刷新（sessionStorage 记着本标签的会话）→ 直接续上（同标签不算冲突）。
@@ -760,6 +762,7 @@ export default function App() {
         onSessionArchive={handleSessionArchive}
         onNewChat={handleNewChat}
         gatewayStatus={gatewayStatus}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
       <main className="main-content">
         {(['trends', 'ideas', 'calendar', 'publish', 'breakdown'] as Page[]).includes(currentPage) && (
@@ -792,6 +795,9 @@ export default function App() {
       {showWizard && (
         <OnboardingWizard onClose={() => setShowWizard(false)} onCreated={handleProfileCreated} />
       )}
+
+      {/* 设置（统一入口：模型配置 · 环境安装 · 更多设置） */}
+      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }

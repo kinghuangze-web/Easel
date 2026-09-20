@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -174,6 +175,54 @@ def _env_key_valid() -> bool:
     return False
 
 
+def _openclaw_config_path() -> Path:
+    """easel 用独立 profile，不碰用户本机的 OpenClaw 配置（与 gateway_questions 同一约定）。"""
+    state = os.environ.get("EASEL_OPENCLAW_STATE_DIR")
+    return (Path(state) if state else Path.home() / ".openclaw-easel") / "openclaw.json"
+
+
+def _primary_model_routable() -> tuple[bool, str]:
+    """检查 agents.defaults.model.primary 指向的 provider 在 openclaw 里真的配了认证。
+
+    上面的 `.env (API Key)` 只查 .env 静态有没有填值，查不出 setup 有没有真把 provider
+    写进 openclaw.json。两边脱节时（例如认证判定被占位符卡住、provider 一个字没写却照样
+    设了 primary），doctor 会全绿而对话直接报
+    "No route-compatible authentication source is configured for <provider>"。
+    这条就是补上 openclaw 侧的对账。
+
+    返回 (是否可路由, 失败提示)。拿不准的情况一律放行，不制造假告警。
+    """
+    cfg_path = _openclaw_config_path()
+    if not cfg_path.is_file():
+        return False, f"{cfg_path} 不存在 — 先跑 bash setup.sh（Windows: setup.ps1）"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return False, f"{cfg_path} 读不出来（{exc}）"
+
+    primary = (((cfg.get("agents") or {}).get("defaults") or {})
+               .get("model") or {}).get("primary") or ""
+    if not primary:
+        return False, "未设置 agents.defaults.model.primary — 重新跑 setup 脚本"
+    if "/" not in primary:
+        # 不是 provider/model 形式，解析不出 provider，交给 `easel ping` 去判，不在这里猜。
+        return True, ""
+
+    provider = primary.split("/", 1)[0]
+    providers = (cfg.get("models") or {}).get("providers") or {}
+    entry = providers.get(provider)
+    if not isinstance(entry, dict):
+        return False, (f"primary 是 {primary}，但 models.providers.{provider} 不存在 —— "
+                       "在 .env 填好真实 key 后重新跑 setup 脚本")
+    # apiKey / 本地适配器 / OAuth 任一即可。字段名随 OpenClaw 版本变过，这里从宽认。
+    has_auth = bool(str(entry.get("apiKey") or "").strip()) or bool(entry.get("localService")) \
+        or any(k for k, v in entry.items() if "oauth" in k.lower() and v)
+    if not has_auth:
+        return False, (f"models.providers.{provider} 没有 apiKey —— "
+                       "在 .env 填好真实 key 后重新跑 setup 脚本")
+    return True, ""
+
+
 def cmd_doctor(_args) -> int:
     print("Easel — 环境检查\n")
     all_ok = True
@@ -223,6 +272,10 @@ def cmd_doctor(_args) -> int:
     env_ok = _env_key_valid()
     all_ok &= _check(".env (API Key)", env_ok,
                       "填 ANTHROPIC_API_KEY，或 EASEL_LLM_API_KEY + EASEL_LLM_BASE_URL")
+
+    # .env 填了 ≠ setup 真的把 provider 写进了 openclaw；不对账就会「doctor 全绿但对话报错」。
+    route_ok, route_detail = _primary_model_routable()
+    all_ok &= _check("OpenClaw model routing", route_ok, route_detail)
 
     # 4. OpenClaw gateway running
     gw_ok = _gateway_healthy()
