@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { ChatSession } from '../lib/store';
 import type { PersonaItem } from '../lib/api';
 import type { ComponentType } from 'react';
@@ -61,6 +61,13 @@ export default function Sidebar({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [showArchived, setShowArchived] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  const closeMenu = () => {
+    if (!expanded) return;
+    setExpanded(false);
+    menuButton.current?.focus();
+  };
 
   const startRename = (s: ChatSession) => { setRenamingId(s.id); setRenameValue(s.title); };
   const commitRename = () => {
@@ -94,9 +101,9 @@ export default function Sidebar({
       <div
         key={s.id}
         className={`session-item ${s.id === activeSessionId ? 'active' : ''}`}
-        onClick={() => onSessionSelect(s.id)}
       >
-        <span className="session-item-title">{s.title}</span>
+        <button className="session-item-title" aria-current={s.id === activeSessionId ? 'true' : undefined}
+          onClick={() => { onSessionSelect(s.id); closeMenu(); }}>{s.title}</button>
         <div className="session-actions">
           <button className="session-act" title="重命名"
             onClick={(e) => { e.stopPropagation(); startRename(s); }}><IconEdit size={14} /></button>
@@ -104,21 +111,27 @@ export default function Sidebar({
             onClick={(e) => { e.stopPropagation(); onSessionArchive(s.id, !isArchived); }}>
             {isArchived ? <IconUnarchive size={14} /> : <IconArchive size={14} />}
           </button>
-          <button className="session-act danger" title="删除"
-            onClick={(e) => { e.stopPropagation(); onSessionDelete(s.id); }}><IconTrash size={14} /></button>
+          {isArchived && <button className="session-act danger" title="永久删除"
+            onClick={() => onSessionDelete(s.id)}><IconTrash size={14} /></button>}
         </div>
       </div>
     );
   };
 
   return (
-    <div className="sidebar">
+    <aside className="sidebar" onKeyDown={(event) => { if (event.key === 'Escape') closeMenu(); }}>
       <div className="sidebar-header">
         <div className="sidebar-logo">
           <img className="sidebar-logo-icon" src="./static/easel-icon-transparent.png" alt="" />
           <h1>Easel</h1>
         </div>
-        <select
+        <button ref={menuButton} type="button" className="btn btn-sm mobile-navigation" aria-controls="sidebar-menu"
+          aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
+          {NAV.find(({ page }) => page === currentPage)?.label || '工作台'}<IconChevron size={14} />
+        </button>
+      </div>
+      <div className="sidebar-menu" id="sidebar-menu" data-expanded={expanded}>
+        {currentPage === 'chat' && <div className="persona-wrap"><select
           className="persona-select"
           value={selectedPersona}
           onChange={(e) => {
@@ -126,7 +139,7 @@ export default function Sidebar({
             onPersonaChange(e.target.value);
           }}
           disabled={activeSessionHasMessages}
-          title={activeSessionHasMessages ? '当前对话已绑定画像，切换画像将新建对话' : '选择用户画像'}
+          aria-label="对话画像"
         >
           <option value="">通用模式</option>
           {personas.map((p) => (
@@ -134,14 +147,16 @@ export default function Sidebar({
           ))}
           <option value="__new__">+ 新建画像…</option>
         </select>
-      </div>
+          {activeSessionHasMessages && <small>当前画像 · 在新对话中可切换</small>}
+        </div>}
 
-      <nav className="sidebar-nav">
+      <nav className="sidebar-nav" aria-label="工作台导航">
         {NAV.map(({ page, Icon, label }) => (
           <button
             key={page}
             className={`nav-item ${currentPage === page ? 'active' : ''}`}
-            onClick={() => onPageChange(page)}
+            aria-current={currentPage === page ? 'page' : undefined}
+            onClick={() => { onPageChange(page); closeMenu(); }}
           >
             <span className="nav-icon"><Icon size={18} /></span>
             {label}
@@ -149,10 +164,10 @@ export default function Sidebar({
         ))}
       </nav>
 
-      <div className="sidebar-section">
+      {currentPage === 'chat' && <div className="sidebar-section">
         <div className="sidebar-section-header">
           <span className="sidebar-section-title">对话</span>
-          <button className="new-chat-btn" onClick={onNewChat} title="新建对话">
+          <button className="new-chat-btn" onClick={() => { onNewChat(); closeMenu(); }} title="新建对话">
             <IconNewChat size={13} /> 新对话
           </button>
         </div>
@@ -160,27 +175,27 @@ export default function Sidebar({
 
         {archived.length > 0 && (
           <>
-            <div className="archived-header" onClick={() => setShowArchived((v) => !v)}>
+            <button type="button" className="archived-header" aria-expanded={showArchived} onClick={() => setShowArchived((v) => !v)}>
               <span className={`archived-chevron ${showArchived ? 'open' : ''}`}><IconChevron size={12} /></span>
               已归档 · {archived.length}
-            </div>
+            </button>
             {showArchived && archived.map((s) => renderItem(s, true))}
           </>
         )}
-      </div>
+      </div>}
 
       <div className="sidebar-status">
         <span className={`status-dot ${gatewayStatus === 'connected' ? '' : 'offline'}`} />
         {gatewayStatus === 'connected'
-          ? '网关已连接'
+          ? '助手可用'
           : gatewayStatus === 'disconnected'
-            ? '网关离线'
+            ? '助手暂不可用'
             : '连接中…'}
-        <button className="settings-gear" onClick={onOpenSettings} title="设置（模型 · 环境 · 更多）">
+        <button className="settings-gear" onClick={() => { closeMenu(); onOpenSettings(); }} title="设置（模型与环境）">
           <IconGear size={13} /> 设置
         </button>
-        <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--text-tertiary)' }}>subnav-1</span>
       </div>
-    </div>
+      </div>
+    </aside>
   );
 }

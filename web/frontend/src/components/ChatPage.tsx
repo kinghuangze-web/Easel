@@ -5,10 +5,15 @@ import BrushEntry from './BrushEntry';
 import type { ChatSession, ChatMessage, StreamState } from '../lib/store';
 import { uploadFiles, adoptOversize } from '../lib/api';
 import type { UploadedFile } from '../lib/api';
+import { EMPTY_DRAFT } from '../lib/chatDraft';
+import type { ChatDraft, ReadingPosition } from '../lib/chatDraft';
 import { IconArrowUp, IconStop, IconPlus, IconFile } from './icons';
 
 interface ChatPageProps {
   session: ChatSession;
+  draft: ChatDraft;
+  readingPositions: Map<string, ReadingPosition>;
+  onDraftChange: (update: (draft: ChatDraft) => ChatDraft) => void;
   stream?: StreamState;          // 进行中的流式态（来自 App，切页也不丢）
   onSend: (displayText: string, attachments?: UploadedFile[]) => void;
   onStop: () => void;
@@ -35,13 +40,16 @@ function greeting(): string {
   return `${g}，想创作点什么？`;
 }
 
-export default function ChatPage({ session, stream, onSend, onStop, onResend, onQuestionAnswered }: ChatPageProps) {
-  const [input, setInput] = useState('');
-  const [attachments, setAttachments] = useState<UploadedFile[]>([]);
-  const [uploading, setUploading] = useState(false);
+export default function ChatPage({ session, draft, readingPositions, onDraftChange, stream, onSend, onStop, onResend, onQuestionAnswered }: ChatPageProps) {
+  const { input, attachments, uploading, uploadError } = draft;
+  const setInput = (value: string) => onDraftChange((d) => ({ ...d, input: value }));
   const [dragOver, setDragOver] = useState(false);
   const [maxMb, setMaxMb] = useState(50);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const threadRef = useRef<HTMLDivElement>(null);
+  const following = useRef(readingPositions.get(session.id)?.following ?? true);
+  const lastScrollTop = useRef(readingPositions.get(session.id)?.top ?? 0);
+  const [showLatest, setShowLatest] = useState(!following.current);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -55,33 +63,22 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
 
   const doUpload = async (fs: FileList | File[]) => {
     const arr = Array.from(fs);
-    if (!arr.length) return;
+    if (!arr.length || uploading || isStreaming) return;
     const cap = maxMb * 1024 * 1024;
     const big = arr.filter((f) => f.size > cap);
     const small = arr.filter((f) => f.size <= cap);
 
-    if (big.length) {
-      // 超限：不走上传通道，复制进收件箱后作为普通附件（界面零新增元素）
-      setUploading(true);
-      try {
-        const saved = await adoptOversize(big, session.id);
-        setAttachments((a) => [...a, ...saved]);
-      } catch (err) {
-        alert((err as Error).message || '超限文件处理失败');
-      } finally {
-        setUploading(false);
-      }
-    }
-    if (!small.length) return;
-    setUploading(true);
-    try {
-      const saved = await uploadFiles(small, session.id);
-      setAttachments((a) => [...a, ...saved]);
-    } catch (err) {
-      alert((err as Error).message || '上传失败');
-    } finally {
-      setUploading(false);
-    }
+    onDraftChange((d) => ({ ...d, uploading: true, uploadError: '' }));
+    const results = await Promise.allSettled([
+      big.length ? adoptOversize(big, session.id) : [],
+      small.length ? uploadFiles(small, session.id) : [],
+    ]);
+    const saved = results.flatMap((result) => result.status === 'fulfilled' ? result.value : []);
+    const failed = results.flatMap((result, i) => result.status === 'rejected' ? (i === 0 ? big : small) : []);
+    onDraftChange((d) => ({
+      ...d, uploading: false, attachments: [...d.attachments, ...saved],
+      uploadError: failed.length ? `${failed.map((file) => file.name).join('、')} 未能添加，请重新选择。` : '',
+    }));
   };
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault(); setDragOver(false);
@@ -90,11 +87,49 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
   const onPaste = (e: React.ClipboardEvent) => {
     if (e.clipboardData.files?.length) { e.preventDefault(); doUpload(e.clipboardData.files); }
   };
-  const removeAttachment = (path: string) => setAttachments((a) => a.filter((x) => x.path !== path));
+  const removeAttachment = (path: string) => onDraftChange((d) => ({
+    ...d, attachments: d.attachments.filter((x) => x.path !== path),
+  }));
 
   useEffect(() => {
-    if (!isEmpty) messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [session.messages, stream?.content, stream?.thinking, stream?.activity, stream?.stillWorking, isEmpty]);
+    const box = messagesRef.current;
+    const thread = threadRef.current;
+    if (!box || !thread) return;
+    const savedPosition = readingPositions.get(session.id);
+    box.scrollTop = following.current ? box.scrollHeight : (savedPosition?.top ?? 0);
+    lastScrollTop.current = box.scrollTop;
+    const resize = new ResizeObserver(() => {
+      if (!following.current) return;
+      box.scrollTop = box.scrollHeight;
+      lastScrollTop.current = box.scrollTop;
+    });
+    resize.observe(thread);
+    resize.observe(box);
+    return () => resize.disconnect();
+  }, [isEmpty, readingPositions, session.id]);
+
+  const onMessageScroll = () => {
+    const box = messagesRef.current;
+    if (!box) return;
+    const top = box.scrollTop;
+    const nearEnd = box.scrollHeight - box.clientHeight - top <= 32;
+    // A scroll event from an earlier stick-to-end can arrive after a reply grows.
+    following.current = nearEnd || (following.current && top >= lastScrollTop.current - 1);
+    lastScrollTop.current = top;
+    readingPositions.set(session.id, { top, following: following.current });
+    setShowLatest(!following.current);
+  };
+
+  const jumpToLatest = () => {
+    const box = messagesRef.current;
+    following.current = true;
+    setShowLatest(false);
+    if (box) {
+      box.scrollTop = box.scrollHeight;
+      lastScrollTop.current = box.scrollTop;
+      readingPositions.set(session.id, { top: box.scrollTop, following: true });
+    }
+  };
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -109,12 +144,12 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
     if ((!trimmed && attachments.length === 0) || isStreaming || uploading) return;
     // 附件通过结构化字段发送；用户消息气泡只显示用户实际输入的文字。
     onSend(trimmed, attachments);
-    setInput('');
-    setAttachments([]);
+    onDraftChange(() => EMPTY_DRAFT);
+    jumpToLatest();
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
       e.preventDefault();
       handleSend();
     }
@@ -151,6 +186,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
       </div>
       <input ref={fileInputRef} type="file" multiple hidden
         onChange={(e) => { if (e.target.files) doUpload(e.target.files); e.target.value = ''; }} />
+      {uploadError && <p className="composer-error" role="alert">{uploadError}</p>}
       <div className="composer-bar">
         <button className="composer-attach-btn" onClick={() => fileInputRef.current?.click()}
           disabled={isStreaming || uploading} title={`添加素材（图片/文档）；超过 ${maxMb}MB 的大文件将自动存为本地素材（不走上传）`}>
@@ -201,8 +237,8 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
 
   return (
     <div className="chat-page">
-      <div className="chat-messages">
-        <div className="chat-thread">
+      <div className="chat-messages" ref={messagesRef} onScroll={onMessageScroll}>
+        <div className="chat-thread" ref={threadRef}>
           {displayMessages.map((msg, i) => {
             const isLast = i === displayMessages.length - 1;
             const live = isStreaming && isLast && msg.role === 'assistant';
@@ -247,11 +283,11 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
           {isStreaming && (stream!.questions?.length ?? 0) > 0 && (
             <QuestionCards questions={stream!.questions || []} onDone={(qid) => onQuestionAnswered?.(qid)} />
           )}
-          <div ref={messagesEndRef} />
         </div>
       </div>
 
       <div className="chat-input-area">
+        {showLatest && <button className="btn btn-sm chat-latest" onClick={jumpToLatest}>回到最新消息</button>}
         <div className="chat-input-inner">{inputBox(false)}</div>
       </div>
     </div>

@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useCallback, useState, useEffect, useMemo } from 'react';
 import type { ComponentType } from 'react';
 import { fetchSkills } from '../lib/api';
 import type { SkillItem } from '../lib/api';
@@ -56,13 +56,16 @@ const LAYER_DESC: Record<string, string> = {
 export default function SkillPage({ persona }: SkillPageProps) {
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<string | null>(null);
 
-  const load = () => {
-    fetchSkills().then(setSkills).catch(() => setError('加载 SKILL 列表失败'));
-  };
-  useEffect(load, []);
+  const load = useCallback(() => {
+    setLoading(true);
+    setError('');
+    void fetchSkills().then(setSkills).catch(() => setError('技能库暂时无法读取。')).finally(() => setLoading(false));
+  }, []);
+  useEffect(load, [load]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -104,13 +107,14 @@ export default function SkillPage({ persona }: SkillPageProps) {
         </div>
       </div>
 
-      {error && <div style={{ color: 'var(--red)', maxWidth: 1100, margin: '16px auto' }}>{error}</div>}
+      {loading && <div className="loading" role="status">正在读取技能库…</div>}
+      {error && <div className="notice-error" role="alert">{error} <button className="btn btn-sm" onClick={load}>重试</button></div>}
 
       <div className="skills-body">
         {orderedLayers.length === 0 && !error && (
-          <div className="empty-state" style={{ height: 240 }}>
+          !loading && !error && <div className="empty-state" style={{ height: 240 }}>
             <div className="empty-icon"><IconSearch size={40} /></div>
-            <p>没有匹配「{query}」的技能</p>
+            <p>{query.trim() ? `没有匹配「${query}」的技能` : '暂无技能'}</p>
           </div>
         )}
 

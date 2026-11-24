@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import EnvBoard from './EnvBoard';
+import LayerDialog from './LayerDialog';
 import type { JobView } from './EnvBoard';
 import {
   fetchEnvTools, startEnvInstall, fetchEnvJob,
   fetchModelChannels, runChannelSelftest, saveModelConfig,
 } from '../lib/api';
 import type { EnvTool, ModelRow, SelftestResult } from '../lib/api';
-import { IconSlidersHorizontal, IconPackage, IconEllipsis } from './settingsIcons';
+import { IconSlidersHorizontal, IconPackage } from './settingsIcons';
 
 interface Props { onClose: () => void; }
 
-type Sec = 'model' | 'env' | 'more';
+type Sec = 'model' | 'env';
 type Chan = 'chat' | 'transcribe' | 'speech' | 'image' | 'video' | 'music';
 
 const CHANNELS: { id: Chan; label: string }[] = [
@@ -234,13 +235,6 @@ export default function SettingsPanel({ onClose }: Props) {
     }
   }, [chan, chatRows, transRows, mediaRows, refreshEnv]);
 
-  // Esc 关闭
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
   // 本地兜底 whisper：从环境工具状态推出来（fw + 模型都在才算就绪）
   const fw = tools.find((t) => t.id === 'fw');
   const modelTool = tools.find((t) => t.id === 'model');
@@ -421,32 +415,28 @@ export default function SettingsPanel({ onClose }: Props) {
   const transOk = transRows.length > 1 && transRows[1].result.includes('已配置');
 
   return (
-    <div
-      className="settings-overlay"
-      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
-    >
-      <div className="settings-panel" role="dialog" aria-modal="true" aria-label="设置">
+    <LayerDialog className="settings-overlay" label="设置" onClose={onClose}>{(close) => (
+      <div className="settings-panel">
         <div className="settings-head">
           <div>
             <h2 className="settings-title">设置</h2>
-            <div className="settings-sub">模型配置 · 环境安装 · 更多设置</div>
           </div>
           <div className="settings-actions">
-            <button
+            {sec === 'model' && <button
               className="btn btn-sm btn-primary"
               onClick={() => void saveCurrent()}
-              disabled={saving || sec !== 'model'}
+              disabled={saving}
             >
               {saving ? '保存中…' : '保存配置'}
-            </button>
-            <button
+            </button>}
+            {sec === 'model' && <button
               className="btn btn-sm"
-              onClick={() => void doSelftest(sec === 'model' ? chan : 'all')}
+              onClick={() => void doSelftest('all')}
               disabled={testing}
             >
               {testing ? '自测中…' : '全部自测'}
-            </button>
-            <button className="settings-close" onClick={onClose} title="关闭（Esc）">✕</button>
+            </button>}
+            <button className="settings-close" onClick={close} aria-label="关闭设置">✕</button>
           </div>
         </div>
 
@@ -457,9 +447,6 @@ export default function SettingsPanel({ onClose }: Props) {
             </button>
             <button className={`snav${sec === 'env' ? ' active' : ''}`} onClick={() => setSec('env')}>
               <IconPackage size={16} />环境安装<small>{total ? (okCount === total ? '全就绪' : `${okCount}/${total}`) : '…'}</small>
-            </button>
-            <button className={`snav${sec === 'more' ? ' active' : ''}`} onClick={() => setSec('more')}>
-              <IconEllipsis size={16} />更多设置
             </button>
           </nav>
 
@@ -571,19 +558,6 @@ export default function SettingsPanel({ onClose }: Props) {
               </section>
             )}
 
-            {sec === 'more' && (
-              <section className="st-sec active">
-                <div className="panel-top">
-                  <span className="pill off"><span className="dot" />可扩展位</span>
-                  <span className="desc">同一个面板，以后放更多设置</span>
-                </div>
-                <div className="board">
-                  <div className="stub-row"><span className="tag2">预留</span>网关参数（端口 / 绑定 / 会话）<span className="future">就挂在这页旁边</span></div>
-                  <div className="stub-row"><span className="tag2">预留</span>通用设置（语言 / 更新 / 数据目录）<span className="future">按需加</span></div>
-                </div>
-                <div className="foot-note">扩展方式：在这个面板里加标签即可——模型、环境已各就位，其余按需加。</div>
-              </section>
-            )}
           </div>
         </div>
 
@@ -591,6 +565,6 @@ export default function SettingsPanel({ onClose }: Props) {
           ⓘ 环境安装在后台执行，装完自动回写状态；模型配置保存写入 .env（对话经本地网关路由，主备自动降级）。
         </div>
       </div>
-    </div>
+    )}</LayerDialog>
   );
 }

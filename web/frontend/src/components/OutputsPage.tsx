@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import type { CSSProperties } from 'react';
+import LayerDialog from './LayerDialog';
 import { fetchOutputs, fetchOutputContent, mediaUrl, deleteOutput } from '../lib/api';
 import type { OutputNode, OutputMeta } from '../lib/api';
 import { renderMarkdown } from '../lib/sanitize';
@@ -81,11 +82,17 @@ export default function OutputsPage() {
   const [selected, setSelected] = useState<OutputNode | null>(null);
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(false);
+  const [treeLoading, setTreeLoading] = useState(true);
+  const [previewError, setPreviewError] = useState('');
+  const [candidate, setCandidate] = useState<OutputNode | null>(null);
+  const [mutating, setMutating] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
   const reqSeq = useRef(0);
 
   const load = useCallback(() => {
     setTreeError('');
-    fetchOutputs().then(setRoots).catch(() => setTreeError('加载产物列表失败'));
+    setTreeLoading(true);
+    fetchOutputs().then(setRoots).catch(() => setTreeError('加载产物列表失败')).finally(() => setTreeLoading(false));
   }, []);
   useEffect(() => { load(); }, [load]);
 
@@ -118,28 +125,36 @@ export default function OutputsPage() {
   const enterDir = useCallback((name: string) => { setStack((s) => [...s, name]); setFilter('all'); }, []);
   const goTo = useCallback((depth: number) => { setStack((s) => s.slice(0, depth)); setFilter('all'); }, []);
 
-  const remove = useCallback(async (node: OutputNode, e: React.MouseEvent) => {
-    e.stopPropagation();
-    const isDir = node.type === 'dir';
-    const label = isDir ? `项目/文件夹「${node.meta?.title || node.name}」及其全部内容` : `文件「${node.name}」`;
-    if (!window.confirm(`确定删除${label}？\n此操作不可恢复。`)) return;
+  const remove = (node: OutputNode, event: React.MouseEvent) => {
+    event.stopPropagation();
+    if (!mutating) setCandidate(node);
+  };
+
+  const permanentlyDelete = async (node: OutputNode) => {
+    if (mutating) return;
+    setMutating(true);
+    setCandidate(null);
+    setDeleteError('');
     try {
       await deleteOutput(node.path);
-      setSelected((cur) => (cur?.path === node.path ? null : cur));
+      setSelected((value) => value?.path === node.path ? null : value);
       load();
-    } catch (err) {
-      alert((err as Error).message || '删除失败');
-    }
-  }, [load]);
+    } catch (error) {
+      setDeleteError((error as Error).message);
+    } finally { setMutating(false); }
+  };
 
   const open = useCallback(async (f: OutputNode) => {
     const seq = ++reqSeq.current;
     setSelected(f); setContent('');
+    setPreviewError('');
+    setLoading(f.kind === 'text' && !isHtml(f.name));
     if (f.kind === 'text' && !isHtml(f.name)) {
-      setLoading(true);
       try {
         const res = await fetchOutputContent(f.path);
         if (seq === reqSeq.current) setContent(res.isBinary ? '' : res.content);
+      } catch {
+        if (seq === reqSeq.current) setPreviewError('暂时无法读取这份文件。');
       } finally { if (seq === reqSeq.current) setLoading(false); }
     }
   }, []);
@@ -169,7 +184,8 @@ export default function OutputsPage() {
     const m = d.meta;
     const cover = coverNode(m) || firstMedia(d);
     return (
-      <div key={d.path} className="card card-hover gcard" onClick={() => enterDir(d.name)}>
+      <div key={d.path} className="card card-hover gcard">
+        <button className="gcard-open" aria-label={`打开文件夹 ${m?.title || d.name}`} onClick={() => enterDir(d.name)} />
         <div className="gcard-thumb">
           <span className="gcard-kind">{m?.kind ? (KIND_LABEL[m.kind] || m.kind) : '文件夹'}</span>
           <button className="gcard-del" title="删除" onClick={(e) => remove(d, e)}><IconTrash size={14} /></button>
@@ -190,7 +206,8 @@ export default function OutputsPage() {
   };
 
   const renderFile = (f: OutputNode) => (
-    <div key={f.path} className="card card-hover gcard" onClick={() => open(f)}>
+    <div key={f.path} className="card card-hover gcard">
+      <button className="gcard-open" aria-label={`预览 ${f.name}`} onClick={() => open(f)} />
       <div className="gcard-thumb">
         <span className="gcard-kind">{kindLabel(f)}</span>
         <button className="gcard-del" title="删除" onClick={(e) => remove(f, e)}><IconTrash size={14} /></button>
@@ -250,7 +267,8 @@ export default function OutputsPage() {
         </div>
       )}
 
-      {empty && !treeError ? (
+      {deleteError && <div className="notice-error" role="alert">{deleteError}</div>}
+      {treeLoading && !roots.length ? <div className="loading" role="status">正在读取内容库…</div> : empty && !treeError ? (
         <div className="empty-state" style={{ height: 300 }}>
           <div className="empty-icon"><IconOutputs size={44} /></div>
           <p>{atTop ? '还没有产物——去对话或技能库生成第一条内容吧' : '这个文件夹是空的'}</p>
@@ -287,22 +305,32 @@ export default function OutputsPage() {
       )}
 
       {selected && (
-        <div className="drawer-overlay" onClick={() => setSelected(null)}>
-          <div className="drawer" onClick={(e) => e.stopPropagation()}>
+        <LayerDialog key={selected.path} className="drawer-overlay" label={selected.name} onClose={() => setSelected(null)}>{(close) => (
+          <div className="drawer">
             <div className="drawer-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div style={{ minWidth: 0 }}>
                 <div className="skill-detail-title" style={{ fontSize: 16 }}>{selected.name}</div>
                 <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 3, fontFamily: "'SF Mono','Consolas',monospace" }}>{selected.path}</div>
               </div>
-              <button className="icon-btn" onClick={() => setSelected(null)}>×</button>
+              <button className="icon-btn" aria-label="关闭预览" onClick={close}>×</button>
             </div>
-            <div className="drawer-body">{preview()}</div>
+            <div className="drawer-body">{previewError ? <div className="notice-error" role="alert">{previewError} <button className="btn btn-sm" onClick={() => open(selected)}>重试</button></div> : preview()}</div>
             <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'flex-end' }}>
               <button className="btn btn-sm btn-danger" onClick={(e) => remove(selected, e)}><IconTrash size={13} /> 删除此文件</button>
             </div>
           </div>
-        </div>
+        )}</LayerDialog>
       )}
+      {candidate && <LayerDialog className="overlay" label="永久删除" onClose={() => setCandidate(null)}>{(close) => (
+        <div className="modal confirm-panel">
+          <h2>永久删除？</h2>
+          <p>「{candidate.meta?.title || candidate.name}」{candidate.type === 'dir' ? '及其全部内容' : ''}将被删除，无法恢复。</p>
+          <div className="dialog-actions">
+            <button className="btn" autoFocus onClick={close}>取消</button>
+            <button className="btn btn-danger" onClick={() => permanentlyDelete(candidate)}>永久删除</button>
+          </div>
+        </div>
+      )}</LayerDialog>}
     </div>
   );
 }
